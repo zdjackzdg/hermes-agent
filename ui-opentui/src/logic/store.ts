@@ -25,6 +25,7 @@ import type { DetailsMode } from './details.ts'
 import { diffStats, type DiffStats } from './diff.ts'
 import type { SessionTabId } from './sessionPicker.ts'
 import { envOutputUnlimited } from './env.ts'
+import { registerNotifier } from './notify.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 
@@ -612,6 +613,10 @@ export function createSessionStore() {
   function setHint(text: string | undefined): void {
     setState('hint', text)
   }
+  // Per-block copy feedback (design pass piece 2): deep view nodes flash
+  // "Copied" on this store's hint line via the notify seam — the same surface
+  // the entry's flashHint uses. One live store per app; latest wins.
+  registerNotifier(setHint)
 
   /** /compact — set the compact-transcript display flag (Epic 3). */
   function setCompact(on: boolean): void {
