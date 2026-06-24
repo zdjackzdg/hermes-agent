@@ -20,7 +20,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Providers that can ground generation on a reference image.
-_REF_CAPABLE = ("openai", "openai-codex", "krea")
+# openrouter / nous reach Gemini Flash Image (and friends) over the
+# OpenRouter-compatible chat-completions image protocol, which accepts
+# reference images for grounding. Nous Portal proxies OpenRouter, so both
+# qualify.
+_REF_CAPABLE = ("openai", "openai-codex", "krea", "openrouter", "nous")
 
 
 class GenerationError(RuntimeError):
