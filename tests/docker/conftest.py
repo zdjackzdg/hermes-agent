@@ -204,7 +204,16 @@ def restart_container(container: str, timeout: int = 60) -> None:
 
     Equivalent to ``docker restart <container>`` followed by
     :func:`wait_for_container_ready`.
+
+    The readiness signal (``profile=default`` in
+    ``/opt/data/logs/container-boot.log``) is append-only and persists
+    across restarts, so we truncate it BEFORE restarting — otherwise
+    ``wait_for_container_ready`` would match the stale line from the
+    previous boot and return before cont-init runs on the new boot.
     """
+    docker_exec(container, "sh", "-c",
+                "truncate -s 0 /opt/data/logs/container-boot.log 2>/dev/null || true",
+                user="root", timeout=5)
     subprocess.run(
         ["docker", "restart", container],
         check=True, capture_output=True, timeout=timeout,

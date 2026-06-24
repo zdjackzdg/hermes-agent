@@ -72,7 +72,13 @@ def test_gateway_run_redirects_to_supervised(
     # well over 5s to reach the redirect logic. The breadcrumb is the
     # definitive signal that the redirect fired — polling for it is
     # both faster on quick machines and flake-free on slow ones.
-    logs = wait_for_docker_logs(container_name, "s6 supervision")
+    # Under heavy parallel docker load (32-way fan-out), the CMD process
+    # (main-wrapper.sh → python → hermes gateway run) can take well over
+    # 30s to import the codebase, load config, and reach the redirect
+    # logic. 60s matches the deadline other boot-readiness polls use.
+    logs = wait_for_docker_logs(
+        container_name, "s6 supervision", deadline_s=60.0,
+    )
     assert "s6 supervision" in logs, (
         f"expected loud breadcrumb in docker logs; got:\n{logs}"
     )
@@ -269,12 +275,24 @@ def test_supervised_gateway_does_not_recurse(
          "gateway", "run"],
         check=True, capture_output=True, timeout=30,
     )
-    time.sleep(6)
 
-    # Count python processes running `hermes gateway run`. If the
-    # recursion guard fails, s6 would respawn fresh `gateway run`
-    # processes on every cycle, leaving multiple Python-process
-    # descendants under the gateway-default supervise tree.
+    # Wait for the redirect to fire by polling for the breadcrumb.
+    # Under CI parallel docker test fan-out, the CMD process
+    # (main-wrapper.sh → python → hermes gateway run) can take well
+    # over 6s to reach the redirect logic. A fixed sleep would race:
+    # if we check too early, the CMD process hasn't exec'd into
+    # `sleep infinity` yet and the s6-supervised gateway hasn't
+    # started either — so we'd see the CMD's `hermes gateway run`
+    # AND the supervised one (2 processes) and falsely conclude
+    # recursion. Polling the breadcrumb is the definitive signal
+    # that the redirect fired and the CMD process is now `sleep`.
+    wait_for_docker_logs(container_name, "s6 supervision")
+
+    # Now that the redirect fired, count python processes running
+    # `hermes gateway run`. If the recursion guard fails, s6 would
+    # respawn fresh `gateway run` processes on every cycle, leaving
+    # multiple Python-process descendants under the gateway-default
+    # supervise tree.
     r = docker_exec_sh(container_name, "ps -eo pid,cmd | grep -v grep | grep -E 'python.*hermes.*gateway run' | wc -l")
     assert r.returncode == 0
     n = int(r.stdout.strip() or 0)
@@ -363,9 +381,16 @@ def test_supervised_gateway_stdout_reaches_docker_logs(
          "gateway", "run"],
         check=True, capture_output=True, timeout=30,
     )
-    # Banner is printed during gateway startup — give it time to
-    # initialize past the imports + config-load phase.
-    time.sleep(8)
+
+    # Poll docker logs for the banner glyph (⚕) or "Hermes Gateway
+    # Starting" — the gateway's rich-console startup banner. A fixed
+    # sleep(8) races under CI parallel docker test fan-out: the
+    # supervised gateway can take well over 8s to finish imports +
+    # config-load + banner print under load, and the assertion would
+    # fail not because the stdout-tee is broken but because we checked
+    # too early. Polling with a generous deadline is both faster on
+    # quick machines and flake-free on slow ones.
+    wait_for_docker_logs(container_name, "⚕", deadline_s=60.0)
 
     logs = subprocess.run(
         ["docker", "logs", container_name],
