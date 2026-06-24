@@ -6,22 +6,41 @@ produce one horizontal strip of N poses). Prompts stay concise and
 sprite-production oriented; the identity lock and "one transparent row" framing
 matter more than flowery description.
 
-Hermes drives six states (see :data:`agent.pet.generate.atlas.ROW_SPECS`); these
-mirror that set rather than the petdex/Codex nine.
+We generate the full petdex/Codex nine-state set (see
+:data:`agent.pet.generate.atlas.ROW_SPECS`) so a hatched pet is a valid
+``petdex submit`` spritesheet.
 """
 
 from __future__ import annotations
 
-# What each Hermes state should depict (kept short — these go straight into the
-# row prompt). Phrased to avoid the common sprite-gen failure modes (detached
-# effects, motion lines, shadows).
+# What each petdex/Codex state should depict (kept short — these go straight into
+# the row prompt). Phrased to avoid the common sprite-gen failure modes (detached
+# effects, motion lines, shadows). Critical distinction: ``running`` is the
+# *working* state (in place), while ``running-right`` / ``running-left`` are the
+# actual directional walk/run cycles.
 STATE_ACTIONS: dict[str, str] = {
     "idle": "a calm idle loop: subtle breathing, a tiny blink or gentle bob, no big gestures",
-    "wave": "a friendly greeting: raising a paw/hand/limb to wave, clear up-and-down gesture",
-    "run": "focused active work: leaning in, concentrating, busy 'thinking/processing' energy (NOT foot-running)",
+    "running-right": (
+        "a sideways walk/run locomotion cycle moving to the RIGHT: the character "
+        "faces and travels right with clear directional steps, a smooth gait loop"
+    ),
+    "running-left": (
+        "a sideways walk/run locomotion cycle moving to the LEFT: the character "
+        "faces and travels left with clear directional steps (the mirror of the "
+        "right-facing run)"
+    ),
+    "waving": "a friendly greeting: raising a paw/hand/limb to wave, clear up-and-down gesture",
+    "jumping": "a happy celebration jump: anticipation, lift off the ground, peak, and land",
     "failed": "a sad or deflated reaction: slumped, dejected, small frown — readable but not noisy",
+    "waiting": (
+        "an expectant 'waiting on you' pose: looking up/out as if asking for input "
+        "or approval — distinct from idle and review"
+    ),
+    "running": (
+        "focused active work, staying IN PLACE (NOT walking or foot-running): "
+        "leaning in, concentrating, busy 'thinking / processing / typing' energy"
+    ),
     "review": "careful inspection: a focused lean, head tilt, studying something intently",
-    "jump": "a happy celebration jump: anticipation, lift off the ground, peak, and land",
 }
 
 _STYLE_HINTS: dict[str, str] = {
@@ -36,8 +55,11 @@ _STYLE_HINTS: dict[str, str] = {
 }
 
 _BACKGROUND = (
-    "Center one full-body character on a fully transparent background. "
-    "No text, no labels, no shadow, no ground line, no scenery, no frame, no border."
+    "Center one full-body character on a flat, uniform, single solid-color "
+    "background that completely surrounds it — one even color with NO gradient, "
+    "vignette, texture, pattern, scenery, shadow, ground line, frame, or border, "
+    "so the background keys out to transparency cleanly. The background color "
+    "must not appear anywhere on the character itself. No text, no labels."
 )
 
 

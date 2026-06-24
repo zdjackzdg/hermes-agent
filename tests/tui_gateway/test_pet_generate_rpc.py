@@ -26,7 +26,7 @@ def test_pet_generate_requires_prompt():
 def test_pet_generate_returns_token_and_previews(monkeypatch, tmp_path):
     import agent.pet.generate as gen
 
-    def fake_drafts(prompt, *, n=4, style="auto", on_draft=None):
+    def fake_drafts(prompt, *, n=4, style="auto", on_draft=None, is_cancelled=None):
         paths = []
         for i in range(n):
             p = tmp_path / f"d{i}.png"
@@ -49,6 +49,38 @@ def test_pet_generate_returns_token_and_previews(monkeypatch, tmp_path):
     assert staged.is_file()
 
 
+def test_pet_cancel_unknown_token_is_noop():
+    resp = server._methods["pet.cancel"]("c0", {"token": "missing"})
+    assert resp["result"]["ok"] is True
+
+
+def test_pet_generate_cancel_stops_run(monkeypatch, tmp_path):
+    import agent.pet.generate as gen
+
+    seen: dict = {}
+
+    def cap_emit(event, sid, payload=None):
+        # Capture the token from the up-front init event so we can cancel it.
+        if event == "pet.generate.progress" and payload and payload.get("token") and not payload.get("dataUri"):
+            seen["token"] = payload["token"]
+
+    monkeypatch.setattr(server, "_emit", cap_emit)
+
+    def fake_drafts(prompt, *, n=4, style="auto", on_draft=None, is_cancelled=None):
+        # Simulate a Stop landing mid-run: the cooperative flag must read True.
+        server._pet_cancel_request(seen["token"])
+        assert is_cancelled() is True
+        return []  # bailed before producing anything
+
+    monkeypatch.setattr(gen, "generate_base_drafts", fake_drafts)
+
+    resp = server._methods["pet.generate"]("rc", {"prompt": "x", "count": 4})
+    assert "error" in resp
+    assert "cancel" in resp["error"]["message"].lower()
+    # The flag is released after the run so reusing the token isn't pre-cancelled.
+    assert server._pet_is_cancelled(seen["token"]) is False
+
+
 def test_pet_hatch_validates_params():
     assert "error" in server._methods["pet.hatch"]("r1", {"name": "x"})  # missing token
     assert "error" in server._methods["pet.hatch"]("r2", {"token": "abc"})  # missing name
@@ -61,7 +93,7 @@ def test_pet_hatch_expired_draft():
 
 
 def _fake_drafts_factory(tmp_path):
-    def fake_drafts(prompt, *, n=4, style="auto", on_draft=None):
+    def fake_drafts(prompt, *, n=4, style="auto", on_draft=None, is_cancelled=None):
         paths = []
         for i in range(n):
             p = tmp_path / f"d{i}.png"
@@ -79,7 +111,7 @@ def _fake_hatch_factory(captured):
     import agent.pet.generate as gen
     from agent.pet import store
 
-    def fake_hatch(*, base_image, slug, display_name="", description="", concept="", style="auto", on_progress=None, provider=None):
+    def fake_hatch(*, base_image, slug, display_name="", description="", concept="", style="auto", on_progress=None, provider=None, is_cancelled=None):
         captured["base_image"] = str(base_image)
         captured["slug"] = slug
         pet = store.register_local_pet(

@@ -10,51 +10,70 @@
 
 import { type CSSProperties } from 'react'
 
+import { PixelEggSprite } from '@/components/pet/pixel-egg-sprite'
+import { Button } from '@/components/ui/button'
 import { Sparkles } from '@/lib/icons'
 
 interface PetEggHatchProps {
-  title: string
   subtitle?: string
+  onCancel?: () => void
+  cancelLabel?: string
 }
 
-// A few off-center freckles so the egg doesn't read as a flat oval.
-const EGG_SPOTS = [
-  { width: '0.6rem', height: '0.45rem', top: '44%', left: '28%' },
-  { width: '0.5rem', height: '0.4rem', top: '60%', left: '58%' },
-  { width: '0.4rem', height: '0.32rem', top: '72%', left: '40%' }
-]
+/**
+ * Thin progress bar. Determinate when given done/total (hatch rows stream one by
+ * one, so a real percentage is meaningful); indeterminate otherwise (drafts
+ * return together, so a count would just snap 0→100).
+ */
+export function PetProgress({ done, total }: { done?: number; total?: number }) {
+  const determinate = typeof done === 'number' && typeof total === 'number' && total > 0
+  const pct = determinate ? Math.min(100, Math.round((done / total) * 100)) : 0
 
-export function PetEggHatch({ title, subtitle }: PetEggHatchProps) {
   return (
-    <div className="flex flex-col items-center justify-center gap-4 px-2 py-8">
-      <div className="flex flex-col items-center">
-        <div className="relative flex h-28 w-24 items-end justify-center">
-          <span className="pet-egg__glow" />
-          <div className="pet-egg">
-            <span className="pet-egg__shine" />
-            {EGG_SPOTS.map((spot, i) => (
-              <span className="pet-egg__spot" key={i} style={spot} />
-            ))}
-          </div>
-        </div>
-        <span className="pet-egg-shadow mt-1" />
-      </div>
-
-      <div className="flex flex-col items-center gap-1 text-center">
-        <p className="text-xs font-medium text-foreground">{title}</p>
-        {subtitle && <p className="max-w-[15rem] text-[0.6875rem] leading-snug text-muted-foreground">{subtitle}</p>}
-      </div>
+    <div
+      aria-valuemax={100}
+      aria-valuemin={0}
+      aria-valuenow={determinate ? pct : undefined}
+      className="pet-progress"
+      role="progressbar"
+    >
+      {determinate ? (
+        <div className="pet-progress__fill" style={{ width: `${pct}%` }} />
+      ) : (
+        <div className="pet-progress__indeterminate" />
+      )}
     </div>
   )
 }
 
-// Sparkle end positions, in rem, radiating from the sprite center.
+export function PetEggHatch({ subtitle, onCancel, cancelLabel }: PetEggHatchProps) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 px-2 py-5">
+      <div className="flex flex-col items-center">
+        <PixelEggSprite mode="bounce" size={88} />
+        <span className="pet-egg-shadow mt-1.5" />
+      </div>
+
+      {subtitle && (
+        <p className="shimmer max-w-[15rem] text-center text-[length:var(--conversation-caption-font-size)] leading-snug">
+          {subtitle}
+        </p>
+      )}
+
+      {onCancel && (
+        <Button onClick={onCancel} size="xs" variant="text">
+          {cancelLabel ?? 'Cancel'}
+        </Button>
+      )}
+    </div>
+  )
+}
+
+// A restrained sparkle burst on reveal — radiating from the sprite center.
 const SPARKLES = [
-  { sx: '-3.2rem', sy: '-2.4rem', size: 'size-4', delay: '40ms' },
-  { sx: '3rem', sy: '-2.8rem', size: 'size-3', delay: '120ms' },
-  { sx: '3.6rem', sy: '1.6rem', size: 'size-4', delay: '0ms' },
-  { sx: '-3.4rem', sy: '1.8rem', size: 'size-3', delay: '160ms' },
-  { sx: '0rem', sy: '-3.4rem', size: 'size-3', delay: '90ms' }
+  { sx: '-3rem', sy: '-2.4rem', size: 'size-3', delay: '40ms' },
+  { sx: '3.2rem', sy: '-2rem', size: 'size-3.5', delay: '0ms' },
+  { sx: '-2.6rem', sy: '2rem', size: 'size-3', delay: '120ms' }
 ]
 
 /** One-shot flash + sparkle burst, layered over a freshly revealed sprite. */

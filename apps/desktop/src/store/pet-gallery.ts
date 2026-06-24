@@ -42,7 +42,8 @@ export type PetGalleryStatus = 'idle' | 'loading' | 'ready' | 'stale' | 'error'
 export type GatewayRequest = <T>(
   method: string,
   params?: Record<string, unknown>,
-  timeoutMs?: number
+  timeoutMs?: number,
+  signal?: AbortSignal
 ) => Promise<T>
 
 /** A JSON-RPC "method not found" — the backend predates the pet RPCs. */
@@ -293,6 +294,9 @@ export function setPetScale(request: GatewayRequest, scale: number): void {
 export function removePet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
   return mutate(slug, fallback, request, async () => {
     await request('pet.remove', { slug })
+    // Evict the by-slug thumb cache so a reused slug doesn't render this pet's
+    // stale thumbnail (the backend drops its disk thumb in parallel).
+    thumbCache.delete(slug)
     patchGallery(g => ({
       ...g,
       enabled: g.active === slug ? false : g.enabled,

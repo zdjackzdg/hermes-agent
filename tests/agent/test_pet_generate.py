@@ -86,9 +86,9 @@ def test_compose_atlas_geometry_and_validation():
 
 
 def test_compose_atlas_leaves_unused_tail_transparent():
-    # wave has 4 frames; columns 4 and 5 of its row must be transparent.
+    # waving has 4 frames; columns 4 and 5 of its row must be transparent.
     sheet = atlas.compose_atlas(_frames_for_all_states())
-    wave_row = next(r for s, r, _ in atlas.ROW_SPECS if s == "wave")
+    wave_row = next(r for s, r, _ in atlas.ROW_SPECS if s == "waving")
     top = wave_row * atlas.CELL_HEIGHT
     for col in (4, 5):
         left = col * atlas.CELL_WIDTH
@@ -114,11 +114,11 @@ def test_validate_atlas_rejects_rgb_residue():
 
 def test_validate_atlas_warns_on_empty_state():
     frames = _frames_for_all_states()
-    frames["jump"] = []
+    frames["jumping"] = []
     sheet = atlas.compose_atlas(frames)
     result = atlas.validate_atlas(sheet)
     assert result["ok"]  # one empty row is a warning, not an error
-    assert any("jump" in w for w in result["warnings"])
+    assert any("jumping" in w for w in result["warnings"])
 
 
 def test_single_frame_fits_cell():

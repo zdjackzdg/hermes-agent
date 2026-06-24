@@ -6,12 +6,16 @@ horizontal strip per state, and these deterministic ops slice that strip into
 clean, centered, transparent ``192x208`` cells and pack them into the sheet our
 renderer reads.
 
-The atlas is **Hermes-native**, not the petdex/Codex format. Our renderer
-(:mod:`agent.pet.render`) keys frames as ``rows = states, cols = frames`` using
-:data:`agent.pet.constants.STATE_ROWS`, so we emit exactly the six states the
-engine drives — idle, wave, run, failed, review, jump — left-packed with
-trailing transparent cells (which the renderer trims). Sheet is
-``COLUMNS*192 x ROWS*208`` (1152x1248).
+The atlas follows the **petdex/Codex standard**: 8 columns x 9 rows of
+``192x208`` cells (``1536x1872``), with the row order + per-row frame counts
+from OpenAI's ``hatch-pet`` skill. Our renderer (:mod:`agent.pet.render`) keys
+frames as ``rows = states, cols = frames`` via
+:data:`agent.pet.constants.CODEX_STATE_ROWS`, and a pet built here is a valid
+``petdex submit`` spritesheet. Rows shorter than 8 columns leave the trailing
+cells fully transparent.
+
+Note ``running`` is the *working* state (in-place processing), NOT locomotion —
+``running-right`` / ``running-left`` are the actual directional walk cycles.
 
 The frame-segmentation, fit-to-cell, and transparency-residue logic is adapted
 from OpenAI's ``hatch-pet`` skill (openai/skills, Apache-2.0).
@@ -32,17 +36,20 @@ CELL_WIDTH = FRAME_W
 CELL_HEIGHT = FRAME_H
 
 # (state, row index, frame count). Order/row indices MUST match
-# ``STATE_ROWS`` so the renderer crops the right row for each driven state.
-# Frame counts are the petdex-ish per-state lengths; the renderer trims any
-# trailing blank columns, so rows shorter than ``COLUMNS`` just leave the tail
-# transparent.
+# ``constants.CODEX_STATE_ROWS`` so the renderer crops the right row for each
+# driven state, and the per-row frame counts mirror the petdex/Codex
+# ``hatch-pet`` ``animation-rows`` spec. The renderer trims trailing blank
+# columns, so rows shorter than ``COLUMNS`` (8) just leave the tail transparent.
 ROW_SPECS: list[tuple[str, int, int]] = [
     ("idle", 0, 6),
-    ("wave", 1, 4),
-    ("run", 2, 6),
-    ("failed", 3, 6),
-    ("review", 4, 6),
-    ("jump", 5, 5),
+    ("running-right", 1, 8),
+    ("running-left", 2, 8),
+    ("waving", 3, 4),
+    ("jumping", 4, 5),
+    ("failed", 5, 8),
+    ("waiting", 6, 6),
+    ("running", 7, 6),
+    ("review", 8, 6),
 ]
 
 ROWS = len(ROW_SPECS)
@@ -93,25 +100,57 @@ def _dominant_corner_color(image) -> tuple[int, int, int]:
     return counter.most_common(1)[0][0]
 
 
-def remove_background(image, *, chroma_key: tuple[int, int, int] | None = None, threshold: float = 110.0):
+def remove_background(image, *, chroma_key: tuple[int, int, int] | None = None, threshold: float = 90.0):
     """Return *image* (RGBA) with its flat background keyed out to transparent.
 
     If the strip already has a transparent background we leave it alone; else we
-    key out *chroma_key* (or the dominant corner color when not given). This
-    handles both providers that emit transparency natively and those that paint
-    a solid backdrop.
+    key out *chroma_key* (or the dominant corner color when not given) via a
+    **border flood-fill**: only background-coloured pixels *connected to an edge*
+    are removed. A global color match (the old approach) punched holes in the pet
+    wherever an interior highlight happened to match the backdrop — e.g. a pug's
+    light belly against a near-white background — which then showed through as the
+    window behind. Flood-fill keeps those interior pixels because they aren't
+    reachable from the border without crossing the (non-background) pet.
     """
+    from collections import deque
+
     rgba = image.convert("RGBA")
     if _has_transparency(rgba):
         return rgba
 
     key = chroma_key or _dominant_corner_color(rgba)
+    w, h = rgba.width, rgba.height
     px = rgba.load()
-    for y in range(rgba.height):
-        for x in range(rgba.width):
-            r, g, b, a = px[x, y]
-            if a > _ALPHA_FLOOR and _color_distance(r, g, b, key) <= threshold:
-                px[x, y] = (0, 0, 0, 0)
+
+    def _is_bg(x: int, y: int) -> bool:
+        r, g, b, a = px[x, y]
+        return a > _ALPHA_FLOOR and _color_distance(r, g, b, key) <= threshold
+
+    visited = bytearray(w * h)
+    queue: deque[tuple[int, int]] = deque()
+
+    # Seed from every border pixel that looks like background.
+    for x in range(w):
+        for y in (0, h - 1):
+            if _is_bg(x, y) and not visited[y * w + x]:
+                visited[y * w + x] = 1
+                queue.append((x, y))
+    for y in range(h):
+        for x in (0, w - 1):
+            if _is_bg(x, y) and not visited[y * w + x]:
+                visited[y * w + x] = 1
+                queue.append((x, y))
+
+    while queue:
+        x, y = queue.popleft()
+        px[x, y] = (0, 0, 0, 0)
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < w and 0 <= ny < h:
+                idx = ny * w + nx
+                if not visited[idx]:
+                    visited[idx] = 1
+                    if _is_bg(nx, ny):
+                        queue.append((nx, ny))
     return rgba
 
 
@@ -314,6 +353,20 @@ def _clear_transparent_rgb(image):
         if data[i + 3] == 0:
             data[i] = data[i + 1] = data[i + 2] = 0
     return Image.frombytes("RGBA", rgba.size, bytes(data))
+
+
+def mirror_frames(frames: list) -> list:
+    """Horizontally flip each frame *in place* (RGBA-safe).
+
+    Used to derive ``running-left`` from an approved ``running-right`` row. The
+    flip is per-frame so the leftward loop preserves the rightward loop's frame
+    order and timing — this is NOT a whole-strip reverse (which would play the
+    animation backwards), matching the petdex/Codex mirror rule.
+    """
+    from PIL import Image
+
+    flip = getattr(Image, "Transpose", Image).FLIP_LEFT_RIGHT
+    return [frame.convert("RGBA").transpose(flip) for frame in frames]
 
 
 def compose_atlas(frames_by_state: dict[str, list]):

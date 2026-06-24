@@ -16,6 +16,7 @@ preview/loading point.
 from __future__ import annotations
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,9 @@ def _harden_transparency(path: Path) -> Path:
     try:
         with Image.open(path) as opened:
             keyed = atlas.remove_background(opened.convert("RGBA"))
+        # Zero the RGB of any leftover semi-transparent edge pixels so a keyed
+        # draft has no colored halo when composited on the dark UI.
+        keyed = atlas._clear_transparent_rgb(keyed)
         out = path.with_suffix(".png")
         keyed.save(out, format="PNG")
         return out
@@ -76,6 +80,7 @@ def generate_base_drafts(
     style: str = "auto",
     provider: SpriteProvider | None = None,
     on_draft: Callable[[int, Path], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> list[Path]:
     """Generate *n* candidate base looks for *concept*; returns image paths.
 
@@ -83,20 +88,33 @@ def generate_base_drafts(
     Drafts are generated concurrently and *on_draft(index, path)* fires as each
     one finishes (not at the end) so callers can stream previews to the UI
     instead of leaving it blank until the whole batch is done.
+
+    *is_cancelled*, when supplied, is polled cooperatively: a draft that hasn't
+    started yet is skipped, and once it trips we stop staging/streaming further
+    drafts and cancel any queued work (already-in-flight provider calls can't be
+    hard-killed, but their results are dropped).
     """
     prompt = prompts.build_base_prompt(concept, style=style)
     sprite = provider or imagegen.resolve_provider(require_references=False)
+    cancelled = is_cancelled or (lambda: False)
 
     # Each draft is its own one-shot generation, run concurrently so the user
     # waits for one image, not N. A single draft failing must not sink the set.
+    logger.info("pet generate: drafting %d base looks for %r (style=%s)", n, concept, style)
+
     def _one(index: int) -> tuple[int, Path | None]:
+        if cancelled():
+            return index, None
+        t0 = time.monotonic()
         try:
             out = imagegen.generate(prompt, n=1, provider=sprite, prefix="pet_base")
         except Exception as exc:  # noqa: BLE001 - tolerate a single failed draft
-            logger.warning("pet base draft failed: %s", exc)
+            logger.warning("pet generate: draft %d failed after %.1fs: %s", index, time.monotonic() - t0, exc)
             return index, None
         if not out:
+            logger.warning("pet generate: draft %d produced no image", index)
             return index, None
+        logger.info("pet generate: draft %d ready in %.1fs", index, time.monotonic() - t0)
         return index, _harden_transparency(out[0])
 
     workers = max(1, min(n, _MAX_PARALLEL_GENERATIONS))
@@ -107,6 +125,11 @@ def generate_base_drafts(
         # gateway event it emits — inherits the request's bound transport, unlike
         # the worker threads above.
         for fut in as_completed(futures):
+            if cancelled():
+                logger.info("pet generate: cancelled — dropping remaining drafts")
+                for pending in futures:
+                    pending.cancel()
+                break
             index, path = fut.result()
             if path is None:
                 continue
@@ -118,7 +141,7 @@ def generate_base_drafts(
                     logger.debug("on_draft callback failed: %s", exc)
 
     drafts = [results[i] for i in sorted(results)]
-    if not drafts:
+    if not drafts and not cancelled():
         raise GenerationError("image generation produced no usable drafts")
     return drafts
 
@@ -133,12 +156,18 @@ def hatch_pet(
     style: str = "auto",
     on_progress: ProgressFn | None = None,
     provider: SpriteProvider | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> HatchResult:
     """Turn an approved base image into a full, installed Hermes pet.
 
     Generates a grounded row strip per state, extracts frames, composes +
     validates the atlas, and registers it. The idle row falls back to the base
     look so the pet always renders. Raises :class:`GenerationError` on failure.
+
+    *is_cancelled*, when supplied, is polled cooperatively: rows that haven't
+    started are skipped, queued rows are cancelled, and once every row is done we
+    abort (raising :class:`GenerationError`) before composing/saving so a stopped
+    hatch never writes a half-built pet.
     """
     base = Path(base_image)
     if not base.is_file():
@@ -146,16 +175,21 @@ def hatch_pet(
 
     sprite = provider or imagegen.resolve_provider(require_references=True)
     progress = on_progress or (lambda *_: None)
+    cancelled = is_cancelled or (lambda: False)
     label = concept or display_name or slug
 
     frames_by_state: dict[str, list] = {}
+    total_rows = len(atlas.ROW_SPECS)
+    logger.info("pet hatch %r: generating %d animation rows", slug, total_rows)
 
     # Generate every state's row strip concurrently — they're independent
     # grounded calls, so the hatch waits for the slowest row, not their sum. A
     # single row failing is tolerated (idle is guaranteed below).
     def _gen_row(spec: tuple[str, int, int]) -> tuple[str, list | None]:
         state, _row, count = spec
-        progress("row", state)
+        if cancelled():
+            return state, None
+        t0 = time.monotonic()
         row_prompt = prompts.build_row_prompt(state, count, label, style=style)
         try:
             strips = imagegen.generate(
@@ -165,16 +199,49 @@ def hatch_pet(
                 provider=sprite,
                 prefix=f"pet_row_{state}",
             )
-            return state, atlas.extract_strip_frames(strips[0], count, method="auto")
+            frames = atlas.extract_strip_frames(strips[0], count, method="auto")
+            logger.info("pet hatch %r: row %r ready in %.1fs", slug, state, time.monotonic() - t0)
+            return state, frames
         except Exception as exc:  # noqa: BLE001 - a single row may fail; keep going
-            logger.warning("pet row '%s' failed: %s", state, exc)
+            logger.warning("pet hatch %r: row %r failed after %.1fs: %s", slug, state, time.monotonic() - t0, exc)
             return state, None
 
-    workers = max(1, min(len(atlas.ROW_SPECS), _MAX_PARALLEL_GENERATIONS))
+    # running-left is derived by mirroring running-right (guaranteed-consistent
+    # and one fewer generation), so we don't generate it directly.
+    generated_specs = [spec for spec in atlas.ROW_SPECS if spec[0] != "running-left"]
+
+    workers = max(1, min(len(generated_specs), _MAX_PARALLEL_GENERATIONS))
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for state, frames in pool.map(_gen_row, atlas.ROW_SPECS):
+        futures = [pool.submit(_gen_row, spec) for spec in generated_specs]
+        # as_completed runs on the caller (request) thread, so progress events
+        # emitted here inherit the request transport — unlike the worker threads.
+        for fut in as_completed(futures):
+            if cancelled():
+                logger.info("pet hatch %r: cancelled — dropping remaining rows", slug)
+                for pending in futures:
+                    pending.cancel()
+                break
+            state, frames = fut.result()
+            done += 1
+            progress("row", f"{state}:{done}:{total_rows}")
             if frames:
                 frames_by_state[state] = frames
+
+    if cancelled():
+        raise GenerationError("hatch cancelled")
+
+    # Derive running-left from the approved running-right row (per-frame mirror,
+    # preserving order/timing). If running-right didn't come back, leave the
+    # left walk empty — a soft warning in validation, not a blocker.
+    right = frames_by_state.get("running-right")
+    if right:
+        done += 1
+        progress("row", f"running-left:{done}:{total_rows}")
+        frames_by_state["running-left"] = atlas.mirror_frames(right)
+        logger.info("pet hatch %r: row 'running-left' mirrored from running-right", slug)
+    else:
+        logger.warning("pet hatch %r: no running-right to mirror; left walk left empty", slug)
 
     # Idle is the resting state the renderer falls back to — guarantee it.
     if not frames_by_state.get("idle"):
@@ -182,6 +249,7 @@ def hatch_pet(
         frames_by_state["idle"] = [atlas.single_frame(base)]
 
     progress("compose", "")
+    logger.info("pet hatch %r: composing atlas from %d states", slug, len(frames_by_state))
     sheet = atlas.compose_atlas(frames_by_state)
     validation = atlas.validate_atlas(sheet)
     if not validation["ok"]:
@@ -190,6 +258,7 @@ def hatch_pet(
     from agent.pet import store
 
     progress("save", slug)
+    logger.info("pet hatch %r: saving pet", slug)
     pet = store.register_local_pet(
         sheet,
         slug=slug,

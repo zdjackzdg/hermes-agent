@@ -5338,6 +5338,30 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5031, f"pet.remove failed: {exc}")
 
 
+@method("pet.rename")
+def _(rid, params: dict) -> dict:
+    """Rename an installed pet's display name (slug/id unchanged).
+
+    Params: ``slug`` + ``name`` (both required). Lets the generate flow hatch
+    with a provisional name and apply the user's chosen name at adopt time.
+    Returns ``{ok, slug, displayName}``.
+    """
+    slug = str(params.get("slug") or "").strip()
+    name = str(params.get("name") or "").strip()
+    if not slug:
+        return _err(rid, 4004, "missing slug")
+    if not name:
+        return _err(rid, 4004, "missing name")
+    try:
+        from agent.pet import store
+
+        ok = store.rename_pet(slug, name)
+        return _ok(rid, {"ok": ok, "slug": slug, "displayName": name})
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("pet.rename failed: %s", exc)
+        return _err(rid, 5031, f"pet.rename failed: {exc}")
+
+
 @method("pet.thumb")
 def _(rid, params: dict) -> dict:
     """Return a small idle-frame PNG (data URI) for one pet — the picker preview.
@@ -5443,6 +5467,49 @@ def _pet_png_data_uri(path, *, max_px: int = 160) -> str:
     return "data:image/png;base64," + base64.standard_b64encode(buf.getvalue()).decode("ascii")
 
 
+# Cooperative cancellation for the heavy pet generation paths. The client's Stop
+# aborts its RPC immediately, but the worker-pool generation keeps running unless
+# told to stop — pet.cancel flips a token's flag, which generate_base_drafts /
+# hatch_pet poll between provider calls to skip work they haven't started.
+_pet_cancel_lock = threading.Lock()
+_pet_cancelled: set[str] = set()
+
+
+def _pet_cancel_arm(token: str) -> None:
+    """Clear a stale cancel flag at the start of a generate/hatch run."""
+    with _pet_cancel_lock:
+        _pet_cancelled.discard(token)
+
+
+def _pet_cancel_request(token: str) -> None:
+    with _pet_cancel_lock:
+        _pet_cancelled.add(token)
+
+
+def _pet_is_cancelled(token: str) -> bool:
+    with _pet_cancel_lock:
+        return token in _pet_cancelled
+
+
+def _pet_cancel_release(token: str) -> None:
+    with _pet_cancel_lock:
+        _pet_cancelled.discard(token)
+
+
+@method("pet.cancel")
+def _(rid, params: dict) -> dict:
+    """Signal an in-flight ``pet.generate``/``pet.hatch`` (by token) to stop.
+
+    Best-effort + idempotent: cancelling an unknown/finished token is a no-op.
+    Stays off the worker pool so it lands while a heavy generation is occupying
+    it. Returns ``{ok: True}``.
+    """
+    token = str(params.get("token") or "").strip()
+    if token:
+        _pet_cancel_request(token)
+    return _ok(rid, {"ok": True})
+
+
 @method("pet.generate")
 def _(rid, params: dict) -> dict:
     """Generate candidate base looks for a new pet (the draft/variant step).
@@ -5474,9 +5541,17 @@ def _(rid, params: dict) -> dict:
         # Token up front so each draft can be staged + streamed the moment it
         # lands, instead of the user staring at a blank grid until all N finish.
         token = uuid.uuid4().hex[:12]
+        _pet_cancel_arm(token)
         stage = root / token
         stage.mkdir(parents=True, exist_ok=True)
         out: list[dict] = []
+
+        # Hand the token to the client up front (token-only init event) so a Stop
+        # fired before the first draft lands can still target this run.
+        try:
+            _emit("pet.generate.progress", "", {"token": token, "count": count})
+        except Exception as exc:  # noqa: BLE001 - streaming is best-effort
+            logger.debug("pet.generate init emit failed: %s", exc)
 
         def _on_draft(index: int, src) -> None:
             dest = stage / f"draft-{index}.png"
@@ -5499,10 +5574,21 @@ def _(rid, params: dict) -> dict:
                 logger.debug("pet.generate progress emit failed: %s", exc)
 
         try:
-            generate_base_drafts(prompt, n=count, style=style, on_draft=_on_draft)
+            generate_base_drafts(
+                prompt,
+                n=count,
+                style=style,
+                on_draft=_on_draft,
+                is_cancelled=lambda: _pet_is_cancelled(token),
+            )
         except GenerationError as exc:
+            _pet_cancel_release(token)
             return _err(rid, 5031, str(exc))
 
+        cancelled = _pet_is_cancelled(token)
+        _pet_cancel_release(token)
+        if cancelled:
+            return _err(rid, 5031, "generation cancelled")
         if not out:
             return _err(rid, 5031, "generation produced no usable drafts")
         out.sort(key=lambda d: d["index"])
@@ -5547,7 +5633,22 @@ def _(rid, params: dict) -> dict:
         if not base.is_file():
             return _err(rid, 4004, "draft expired — generate again")
 
+        _pet_cancel_arm(token)
         slug = store.unique_slug(name)
+
+        def _on_progress(event: str, detail: str) -> None:
+            # Row progress is encoded as "<state>:<done>:<total>" so the egg
+            # screen can show "Drawing <state>… (n/total)"; other phases
+            # (compose, save) pass through as-is. Best-effort streaming.
+            payload: dict = {"event": event, "detail": detail}
+            if event == "row" and detail.count(":") == 2:
+                state, done, total = detail.split(":")
+                payload = {"event": "row", "state": state, "done": done, "total": total}
+            try:
+                _emit("pet.hatch.progress", "", payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pet.hatch progress emit failed: %s", exc)
+
         try:
             result = hatch_pet(
                 base_image=base,
@@ -5556,9 +5657,13 @@ def _(rid, params: dict) -> dict:
                 description=str(params.get("description") or ""),
                 concept=str(params.get("prompt") or name),
                 style=str(params.get("style") or "auto").strip() or "auto",
+                on_progress=_on_progress,
+                is_cancelled=lambda: _pet_is_cancelled(token),
             )
         except GenerationError as exc:
             return _err(rid, 5031, str(exc))
+        finally:
+            _pet_cancel_release(token)
 
         pet = store.load_pet(result.slug)
         payload = _pet_sprite_payload(pet, scale=_pet_config_scale()) if pet else {}

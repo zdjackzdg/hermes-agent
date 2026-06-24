@@ -636,9 +636,13 @@ export interface Translations {
       generating: string
       retry: string
       hatch: string
+      spawning: string
       hatching: string
       hatchingSub: string
       hatched: string
+      hatchRow: (state: string, done: number, total: number) => string
+      hatchComposing: string
+      hatchSaving: string
       namePlaceholder: string
       staleBackend: string
       adopt: string

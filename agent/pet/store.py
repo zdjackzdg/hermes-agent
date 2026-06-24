@@ -346,11 +346,50 @@ def remove_pet(slug: str) -> bool:
     """Delete an installed pet directory.  Returns True if anything was removed."""
     import shutil
 
-    directory = pets_dir() / slug.strip()
+    slug = slug.strip()
+
+    # The cached thumbnail lives in pets/.thumbs/<slug>.png — OUTSIDE the pet
+    # dir, so rmtree won't catch it. Drop it too, or a later pet that reuses this
+    # slug renders this one's stale thumbnail.
+    try:
+        (_thumbs_dir() / f"{slug}.png").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    directory = pets_dir() / slug
     if not directory.is_dir():
         return False
     shutil.rmtree(directory, ignore_errors=True)
     return not directory.exists()
+
+
+def rename_pet(slug: str, display_name: str) -> bool:
+    """Update an installed pet's displayName in its ``pet.json``.
+
+    The slug/dir (the stable id) is left untouched; only the human-facing
+    ``displayName`` changes. Lets the generate flow hatch with a provisional
+    name and let the user name the pet on the reveal screen. Returns True on a
+    successful write.
+    """
+    slug = slug.strip()
+    display_name = (display_name or "").strip()
+    if not slug or not display_name:
+        return False
+    pet_json = pets_dir() / slug / "pet.json"
+    if not pet_json.is_file():
+        return False
+    try:
+        meta = json.loads(pet_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["displayName"] = display_name
+    try:
+        pet_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def _download(url: str, dest: Path, *, timeout: float) -> None:
